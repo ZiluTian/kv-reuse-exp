@@ -183,7 +183,21 @@ eviction-policy iteration loop.
 **Results so far (2026-10-28, smoke + ablation grids — not the
 pre-registered run):**
 - LPM routing beats the default (≈ SGLang-as-shipped) with the stock LRU
-  cache: B1 vs B0 = +0.086 mean reuse ratio (artifact:
+  cache: B1 vs B0 = +0.086 mean reuse ratio.
+- Full system (S = LPM routing + v5 score) on the same smoke grid:
+  S vs B0 = **+0.135** mean reuse ratio (0.712 → 0.847), a ~47% reduction
+  in recompute tokens, capturing **61.8%** of the oracle gap (S_oracle
+  0.931). The v1-era comparison is instructive: with the last-anchored
+  score v1, S scored 0.694 — *below* B0 (−0.018, −8% oracle capture) —
+  i.e. the old policy destroyed more reuse than the routing created;
+  placement alone (B2) went from −0.141 vs B0 (v1) to +0.050 (v5).
+  The pre-registered verdict is still FAIL, but the character changed:
+  the gain passes the README §4 "≥20% recompute-token reduction" reading
+  (47% > 20%) yet misses the runner's conservative ≥ +0.20
+  absolute-reuse gate, and the TTFT p95 cost (+56.6% of B0, mostly
+  inherited from LPM routing) misses the ≤ 15% gate — threshold tuning /
+  the escape-k hatch are the documented path (README §4, §9). Artifacts:
+  `results/smoke-20261028-score-v5/` (v1-era:
   `results/smoke-20261028-score-v1/`).
 - Score-policy iteration (lineage documented in the `sim/simulator.py`
   docstring): v1 last-anchored past-hit (failed, kept as ablation arm) →
