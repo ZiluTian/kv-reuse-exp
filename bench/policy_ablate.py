@@ -8,15 +8,19 @@ Grid (seed 0, n_requests=2000, n_families=100):
     alpha {0.3, 1.0, 2.5} x lifetime {0.5, 1.0, 3.0}
     x n_gpus {1, 2, 4} x budget {0.2, 0.5, 1.0}   =  81 configs
 Cells (all rr routing, to isolate the EVICTION policy -- the placement arm):
-    lru (B0) | score_v1 (last-anchored, ablation) | score (now-anchored, v3)
+    lru (B0) | score_v1 (last-anchored, ablation) | score (v5 composite key)
 
-Outputs a per-config table, per-regime means, and win counts. v3 knobs:
-    --death F   death threshold = F x window (default 1.0)
-    --clip      clip the per-family gap estimate to [death/10, death]
+Outputs a per-config table, per-regime means, and win counts. v5 knobs:
+    --death-k F   death threshold, in units of the family's own gap (default 3.0)
+    --shrink-k F  empirical-Bayes shrinkage: equivalent prior observations
+                  (default 5.0; 0 = un-shrunken raw gap, the pure v3 arm)
+    --rec-c F     composite-key silence weight, K = gap_eff + rec_c x silence
+                  (default 1.0; 0.0 = v4, gap only)
+    --clip        clip the per-family raw gap to [window/10, window]
 
 Example:
     python3 bench/policy_ablate.py
-    python3 bench/policy_ablate.py --death 2.0 --clip
+    python3 bench/policy_ablate.py --death-k 4.0 --rec-c 0 --clip
 """
 import argparse
 import os
@@ -43,10 +47,18 @@ def main():
     p.add_argument("--n-requests", type=int, default=2000)
     p.add_argument("--n-families", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--death", type=float, default=1.0,
-                   help="v3 death threshold, in windows (default 1.0)")
+    p.add_argument("--death-k", type=float, default=3.0,
+                   help="v3 death threshold, in units of the family's own "
+                        "effective gap (default 3.0)")
+    p.add_argument("--shrink-k", type=float, default=5.0,
+                   help="v5 empirical-Bayes shrinkage: equivalent prior "
+                        "observations (default 5.0; 0 = un-shrunken)")
+    p.add_argument("--rec-c", type=float, default=1.0,
+                   help="v5 composite-key weight on the silence (liveness) "
+                        "term, K = gap_eff + rec_c x silence "
+                        "(default 1.0; 0.0 = v4, gap only)")
     p.add_argument("--clip", action="store_true",
-                   help="v3: clip per-family gap to [death/10, death]")
+                   help="v3: clip per-family raw gap to [window/10, window]")
     p.add_argument("--out", default=None, help="optional CSV dump")
     a = p.parse_args()
 
@@ -65,7 +77,9 @@ def main():
                     for cell, kw in CELLS:
                         kw2 = dict(kw)
                         if cell == "score":
-                            kw2["death"] = a.death * (tr.horizon / 10.0)
+                            kw2["death_k"] = a.death_k
+                            kw2["shrink_k"] = a.shrink_k
+                            kw2["rec_c"] = a.rec_c
                             kw2["gap_clip"] = a.clip
                         r = simulate(tr, ng, pool, routing="rr", eviction=cell,
                                      **kw2, cell=cell)

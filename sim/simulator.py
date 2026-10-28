@@ -27,8 +27,10 @@ lru:
     homogeneous inter-arrival rates (recency IS the signal), which is why it
     is a strong baseline: it cannot make O(1) "family is dead" errors.
 
-score (the reuse-aware placement of the hypothesis, v3):
-    Prefix-family-granular, NOW-ANCHORED expected-gap eviction.
+score (the reuse-aware placement of the hypothesis, v5):
+    Prefix-family-granular, NOW-ANCHORED expected-gap eviction, with a
+    COMPOSITE eviction key that combines the rate signal and the liveness
+    signal (see the recency_c bullet below).
     Key workload fact: in multi-turn serving every future request for a
     family references ALL of its blocks so far (context only grows), so the
     placement decision is purely per-family -- which family's next turn is
@@ -39,17 +41,58 @@ score (the reuse-aware placement of the hypothesis, v3):
       observations in the window.
     - gap(f) = (last - first_in_window)/(n_in_window - 1) when >= 2
       observations, else the gap prior.
-      Expected return = NOW + gap(f): the Poisson hazard is memoryless, so
+      Expected return = NOW + gap_eff(f): the Poisson hazard is memoryless, so
       the correct conditional expectation of the next turn is anchored at
       decision time. (Anchoring at last use -- v1/v2 below -- puts families
       that merely had one long gap at a return time in the PAST, inverting
       the eviction order; a brand-new family also has the MOST remaining
       turns, not the fewest.)
-    - dead: silence >= `death` (default: window) -> gap = INF (evicted
-      first). Liveness is decided by silence, rate by the observed gaps --
-      there is no hard "recent-window count" test.
+    - EMPIRICAL-BAYES SHRINKAGE of the per-family gap toward the
+      population prior (mean per-family gap, EMA-updated), with equivalent
+      prior sample size shrink_k (default 5):
+          lambda_eff = (n/gap_raw + k/prior) / (n + k),  gap_eff = 1/lambda_eff
+      This is the fix that makes the policy span the popularity range:
+      at low Zipf alpha all rates are ~equal, so a family's raw gap estimate
+      is pure noise and the policy must be NEUTRAL among live families (the
+      shrunken gap ~= the common prior, and the heap tie-break then acts as
+      recency, matching LRU's optimal behavior); at high alpha the hot head
+      has many observations (n >> k) and keeps its full signal. Measured
+      without shrinkage (k=0): the noisy raw-gap ranking cost ~0.1-0.15
+      reuse vs LRU at alpha <= 1.0.
+    - COMPOSITE KEY, K(f) = gap_eff(f) + rec_c x silence(f) (default
+      rec_c = 1; rec_c = 0 reproduces v4). Why both terms:
+      * gap_eff is the RATE signal -- among live families it ranks by how
+        soon each is expected back (memoryless hazard: for a LIVE family the
+        expected return is now + gap_eff, independent of how long it has
+        been quiet, so recency adds no rate information);
+      * silence is the LIVENESS signal -- for a Poisson process, being quiet
+        is evidence of death, and the hard death test below only acts at
+        silence >= death_k x gap_eff. Before that cliff, a dead family is
+        ranked by its STALE gap_eff, which can put a corpse ahead of live
+        families for the eviction slot (the main way v4 lost to LRU at
+        alpha <= 1.0, where the pool is crowded with corpses whose
+        recycling LRU does instantly via recency). Adding rec_c x silence
+        makes corpses sink continuously, without waiting for the cliff.
+      * Net effect: at low Zipf alpha (homogeneous rates) gap_eff ~= prior
+        for everyone, the key is dominated by silence, and the policy
+        degenerates to recency -- LRU's optimal behavior there; at high
+        alpha the hot head stays recently used AND small-gapped (kept),
+        the cold tail is both slow and quiet (evicted first).
+      The key is implemented as (gap_eff - rec_c x last_use) in the heap:
+      the common +rec_c x now term is order-invariant, and last_use only
+      changes on arrival, so the HEAP_TOL validity check keeps working.
+    - dead: silence >= death_k x gap_eff (default death_k = 3) -> gap = INF
+      (evicted first). The silence tolerance is PACE-RELATIVE: a family's
+      own estimated gap sets how long a silent stretch is evidence of death
+      (a uniform ~5% false-death rate, exp(-death_k), for live families
+      regardless of pace). A fixed wall-clock window is wrong: a family with
+      30 s turns must be declared dead within ~90 s of dying, not after 360
+      s of looking indistinguishable from an active family. With rec_c > 0
+      the cliff matters less (near-dead families are already ranked near
+      the top by the silence term), but the INF mark still guarantees
+      corpses rank above finite-key families.
     - On pool overflow, evict one block from the family with the LARGEST
-      gap, taking that family's HIGHEST-position block first, so a
+      composite key, taking that family's HIGHEST-position block first, so a
       partially-resident family keeps its leading prefix (a hit requires
       contiguity from block 0).
 
@@ -84,7 +127,9 @@ PREBLOCK_S = 0.0016   # s per 16-token block: ~100 us/token batch-1 prefill
 DECTOK_S = 0.025      # s per decode token: ~40 tok/s batch-1
 INF = float("inf")
 MIN_ELAPSED = 1e-3    # s, guard for the v1 mean-gap estimate
-PRIOR_BETA = 0.1      # EMA weight for new observed inter-arrivals
+PRIOR_BETA = 0.1      # EMA weight for the per-family-mean gap prior
+DEFAULT_SHRINK_K = 5.0  # equivalent prior observations (0 = no shrinkage)
+HEAP_TOL = 1e-2       # relative validity tolerance for score heap entries
 
 
 def _leading_hits(blocks, resident):
@@ -111,31 +156,45 @@ def _fam_of(b, unique, cum_len):
 
 
 class _Gpu:
-    __slots__ = ("i", "pool", "eviction", "window", "death", "gap_clip",
-                 "resident", "lru_order", "score_heap", "fam_first",
-                 "fam_deques", "fam_last", "fam_blocks", "g_prior",
-                 "last_end", "completions", "req_count", "occ_sum", "n_occ")
+    __slots__ = ("i", "pool", "eviction", "window", "death_k", "shrink_k",
+                 "rec_c", "gap_clip", "resident", "lru_order", "score_heap",
+                 "fam_first", "fam_deques", "fam_last", "fam_blocks",
+                 "fam_tail", "g_prior", "last_end", "completions", "req_count",
+                 "occ_sum", "n_occ")
 
-    def __init__(self, i, pool, eviction, window, death=None, gap_clip=False):
+    def __init__(self, i, pool, eviction, window, death_k=3.0,
+                 shrink_k=DEFAULT_SHRINK_K, rec_c=1.0, gap_clip=False):
         self.i = i
         self.pool = pool
         self.eviction = eviction
         self.window = window
-        self.death = death if death is not None else window
+        self.death_k = death_k
+        self.shrink_k = shrink_k
+        self.rec_c = rec_c
         self.gap_clip = gap_clip
         self.resident = {}            # block -> None (membership only)
         self.lru_order = collections.OrderedDict()
         # score-family heaps (see _evict for entry shapes):
-        #   v3 ("score"):    (-gap, t_push, fam)
+        #   v5 ("score"):    (-(gap_eff - rec_c*last_use), t_push, fam)
+        #                     == -(composite key) up to an order-invariant
+        #                     constant (see module docstring)
         #   v1 ("score_v1"): (-en, last_p, cnt_p, first, fam)
-        # Min-heap => top = family with the FARTHEST expected return (INF gap
+        # Min-heap => top = family with the LARGEST composite key (INF gap
         # = dead family) = the one to evict.
         self.score_heap = []
         self.fam_first = {}           # family -> first-seen time (v1 + debug)
         self.fam_deques = {}          # family -> deque of arrivals within window
         self.fam_last = {}            # family -> last arrival time
         self.fam_blocks = {}          # family -> set of resident block ids
-        self.g_prior = window / 2.0   # EMA of observed inter-arrivals
+        # max-heap (of -block-id) of each family's resident blocks, with
+        # LAZY DELETION (stale tops are dropped in _evict). Eviction always
+        # takes the family's highest-position block, so the heap top IS the
+        # answer in amortized O(log n) -- a bare max() over the set would
+        # re-scan O(family size) per eviction, which is quadratic-ish once a
+        # hot family dies with thousands of resident blocks (the alpha=2.5
+        # tight-budget path).
+        self.fam_tail = {}            # family -> list heap of -block ids
+        self.g_prior = window / 2.0   # prior: mean PER-FAMILY gap (EMA)
         self.last_end = 0.0
         self.completions = collections.deque()  # end times, for queue length
         self.req_count = 0
@@ -155,34 +214,48 @@ class _Gpu:
 
     # ---------- v3 (score) signal ----------
     def _gap_v3(self, f, now):
-        """Estimated inter-turn gap of family f at time `now` (v3).
+        """Effective inter-turn gap of family f at time `now` (v3/v4).
 
-        Dead families (silence >= death) get INF. With < 2 observations in
-        the window the per-family rate is unknown: use the GPU-level prior.
+        Dead families (silence >= death_k x their own effective gap) get
+        INF. The raw per-family gap is shrunk toward the per-family-mean
+        population prior (empirical Bayes, equivalent sample size
+        shrink_k): families with few in-window observations have an
+        estimate that is mostly noise, and shrinking keeps them neutral
+        (which is the right behavior when rates are homogeneous).
         """
-        if now - self.fam_last[f] >= self.death:
-            return INF
         dq = self.fam_deques.get(f)
-        if dq is None or len(dq) < 2:
-            g = self.g_prior
+        n = max(len(dq) - 1, 0) if dq else 0
+        if n >= 1:
+            gap_raw = (dq[-1] - dq[0]) / n
         else:
-            g = (dq[-1] - dq[0]) / (len(dq) - 1)
+            gap_raw = self.g_prior
         if self.gap_clip:
-            g = min(max(g, self.death / 10.0), self.death)
-        return g
+            gap_raw = min(max(gap_raw, self.window / 10.0), self.window)
+        if self.shrink_k > 0:
+            lam_eff = (n / gap_raw + self.shrink_k / self.g_prior) \
+                / (n + self.shrink_k)
+            gap_eff = 1.0 / lam_eff
+        else:
+            gap_eff = gap_raw
+        if now - self.fam_last[f] >= self.death_k * gap_eff:
+            return INF
+        return gap_eff
 
     def _note_arrival(self, f, t):
         """Record a request for family f at time t (score-policy signal)."""
         if f not in self.fam_first:
             self.fam_first[f] = t
-        else:
-            # update the gap prior from this observed inter-arrival
-            self.g_prior = (1.0 - PRIOR_BETA) * self.g_prior \
-                + PRIOR_BETA * (t - self.fam_last[f])
         dq = self.fam_deques.setdefault(f, collections.deque())
         while dq and dq[0] < t - self.window:
             dq.popleft()
         dq.append(t)
+        if len(dq) >= 2:
+            # update the prior from this family's current gap estimate
+            # (weighted per FAMILY, not per arrival, so it targets the
+            # mean per-family rate -- the right shrinkage target)
+            gap_obs = (dq[-1] - dq[0]) / (len(dq) - 1)
+            self.g_prior = (1.0 - PRIOR_BETA) * self.g_prior \
+                + PRIOR_BETA * gap_obs
         self.fam_last[f] = t
         self.fam_blocks.setdefault(f, set())
         if self.eviction == "score_v1":
@@ -190,7 +263,13 @@ class _Gpu:
                            (-self._expected_next_v1(f, t, len(dq)), t, len(dq),
                             self.fam_first[f], f))
         else:
-            heapq.heappush(self.score_heap, (-self._gap_v3(f, t), t, f))
+            # composite key: gap_eff + rec_c * silence; the common
+            # rec_c * t term is order-invariant, so store the offset form
+            # (gap_eff - rec_c * last_use), which only changes on arrival
+            # and on prior drift (keeps the HEAP_TOL validity check cheap)
+            heapq.heappush(self.score_heap,
+                           (-(self._gap_v3(f, t) -
+                              self.rec_c * self.fam_last[f]), t, f))
 
     # ---------- eviction ----------
     def _finish_evict(self, f, reheap):
@@ -203,6 +282,7 @@ class _Gpu:
             self.fam_deques.pop(f, None)
             self.fam_last.pop(f, None)
             self.fam_blocks.pop(f, None)
+            self.fam_tail.pop(f, None)
         else:
             heapq.heappush(self.score_heap, reheap)
 
@@ -219,7 +299,7 @@ class _Gpu:
             if self.eviction == "score_v1":
                 neg_en, last_p, cnt_p, first, f = entry
             else:
-                neg_g, t_push, f = entry
+                neg_k, t_push, f = entry
             blocks = self.fam_blocks.get(f)
             if not blocks:
                 continue  # fully evicted -> stale entry
@@ -236,12 +316,29 @@ class _Gpu:
                 key = (-self._expected_next_v1(f, now, cnt),
                        self.fam_last[f], cnt, first)
             else:
-                g_now = self._gap_v3(f, now)
-                if -g_now != neg_g:
-                    heapq.heappush(self.score_heap, (-g_now, now, f))
+                k_now = self._gap_v3(f, now) - self.rec_c * self.fam_last[f]
+                # tolerance-based validity: last_use only changes on
+                # arrival and gap_eff only drifts with the prior, so a
+                # stale entry is detected by a key move beyond the
+                # tolerance (a hard equality would force an
+                # O(n_families) re-push churn per eviction). The offset
+                # form is immune to the common rec_c x now growth of the
+                # composite key. (Dead flip: INF - finite -> INF move,
+                # re-push; two INFs -> NaN > tol is False, entry stays
+                # valid, key = -INF as intended.)
+                if abs(k_now - (-neg_k)) > HEAP_TOL * max(1.0, abs(k_now),
+                                                         abs(-neg_k)):
+                    heapq.heappush(self.score_heap, (-k_now, now, f))
                     continue
-                key = (-g_now, now)
-            b = max(blocks)  # highest position: least useful for leading hits
+                key = (-k_now, now)
+            # highest-position block first: least useful for leading hits
+            # (lazy-delete the family's tail heap: stale entries are blocks
+            # already evicted from this family by an earlier pass)
+            tail = self.fam_tail[f]
+            while True:
+                b = -heapq.heappop(tail)
+                if b in blocks:
+                    break
             del self.resident[b]
             self.lru_order.pop(b, None)
             blocks.discard(b)
@@ -255,7 +352,8 @@ class _Gpu:
 
 
 def simulate(trace, n_gpus, pool_blocks, routing="rr", eviction="lru",
-             escape_k=0.0, window=None, death=None, gap_clip=False, cell=""):
+             escape_k=0.0, window=None, death_k=3.0, shrink_k=DEFAULT_SHRINK_K,
+             rec_c=1.0, gap_clip=False, cell=""):
     """Run one cell. pool_blocks = KV pool size PER GPU (the fixed budget).
 
     routing in {"rr", "lpm"}; eviction in {"lru", "score", "score_v1"}.
@@ -264,15 +362,19 @@ def simulate(trace, n_gpus, pool_blocks, routing="rr", eviction="lru",
     (load-balance escape hatch, README section 5 ablation).
     window: recency window (s) for the score policies' gap estimate.
             Default: horizon / 10.
-    death:  silence after which a family is treated as dead (score v3).
-            Default: window.
-    gap_clip: clip the v3 per-family gap estimate to [death/10, death].
+    death_k: v5 death threshold, in units of the family's own effective gap
+             (silence >= death_k x gap => dead; default 3.0).
+    shrink_k: v5 empirical-Bayes shrinkage, equivalent prior observations
+              (default 5.0; 0 = raw un-shrunken gap, the pure v3 arm).
+    rec_c: v5 composite-key weight on the silence (liveness) term:
+           K = gap_eff + rec_c x silence (default 1.0; 0.0 = v4, gap only).
+    gap_clip: clip the v5 per-family raw gap to [window/10, window].
     """
     unique = trace.unique_prefix_blocks
     cum_len = list(itertools.accumulate(trace.family_lengths))
     window = window if window is not None else trace.horizon / 10.0
-    gpus = [_Gpu(i, pool_blocks, eviction, window, death=death,
-                 gap_clip=gap_clip)
+    gpus = [_Gpu(i, pool_blocks, eviction, window, death_k=death_k,
+                 shrink_k=shrink_k, rec_c=rec_c, gap_clip=gap_clip)
             for i in range(n_gpus)]
     rr_idx = 0
     prompt_blocks = hit_blocks = 0
@@ -326,6 +428,7 @@ def simulate(trace, n_gpus, pool_blocks, routing="rr", eviction="lru",
                 if fb not in g.fam_first:
                     g._note_arrival(fb, t)
                 g.fam_blocks.setdefault(fb, set()).add(b)
+                heapq.heappush(g.fam_tail.setdefault(fb, []), -b)
             else:
                 g.lru_order.move_to_end(b)
             while len(g.resident) > pool_blocks:

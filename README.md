@@ -99,9 +99,16 @@ obtainable ("deployment-realistic" arm).
   — quantifies whether the reuse *signal* or the *policy* is the bottleneck.
 - **Ablate the signal (implemented):** `score_v1` = past-hit-based,
   windowed count, last-anchored expected-next (the LFU-like arm) vs.
-  `score` = predicted inter-turn gap, now-anchored (v3). Driven by
-  `bench/policy_ablate.py`; v1 measured worse than LRU on the smoke grid
-  and is kept as the documented ablation arm.
+  `score` = composite eviction key (v5, the default):
+  `K = gap_eff + rec_c × silence`, where `gap_eff` is the empirical-Bayes
+  shrunken inter-turn gap estimate (the *rate* signal) and `silence` is
+  time-since-last-arrival (the *liveness* signal). `rec_c` = 1.0,
+  `death_k` = 3.0, `shrink_k` = 5.0. At low Zipf α (homogeneous rates) the
+  key degenerates to recency (= LRU-optimal); at high α the hot head is both
+  fast and recently used (kept) and cold tails are both slow and quiet
+  (evicted first). Driven by `bench/policy_ablate.py` (`--death-k`,
+  `--shrink-k`, `--rec-c`, `--clip`); v1 measured worse than LRU on the
+  smoke grid and is kept as the documented ablation arm.
 - **Ablate routing:** pure LPM vs. LPM with a load-balance escape hatch
   (deviate from the overlap-best GPU when its queue exceeds k× the mean).
   Main practical failure mode; worth its own knob.
@@ -173,15 +180,27 @@ pre-registered factorial; `bench/ablations.sh` runs the escape-k and
 recency-window ablations; `bench/policy_ablate.py` is the fast
 eviction-policy iteration loop.
 
-**Results so far (2026-10-28, smoke grid only — not the pre-registered run):**
+**Results so far (2026-10-28, smoke + ablation grids — not the
+pre-registered run):**
 - LPM routing beats the default (≈ SGLang-as-shipped) with the stock LRU
   cache: B1 vs B0 = +0.086 mean reuse ratio (artifact:
   `results/smoke-20261028-score-v1/`).
-- Score v1 (windowed past-hit, last-anchored) measured ~0.14 WORSE than LRU
-  (B2: 0.571 vs 0.712) — failure modes documented in the `sim/simulator.py`
-  docstring; superseded by score v3 (now-anchored expected inter-turn gap),
-  currently under ablation.
-- Clairvoyant oracle on the same grid: 0.931 → +0.22 headroom over B0.
+- Score-policy iteration (lineage documented in the `sim/simulator.py`
+  docstring): v1 last-anchored past-hit (failed, kept as ablation arm) →
+  v3 now-anchored gap → v3b pace-relative death → v4 empirical-Bayes
+  shrinkage (27/81 ≥ LRU) → **v5 composite key `gap_eff + rec_c×silence`**
+  (default): **62/81 configs ≥ LRU**, positive in every regime mean on the
+  81-config ablation grid (α {0.3,1.0,2.5} × lifetime {0.5,1.0,3.0} ×
+  ngpu {1,2,4} × budget {0.2,0.5,1.0}, seed 0): +0.005…+0.009 at α=0.3,
+  +0.005…+0.008 at α=1.0, **+0.135…+0.139 at α=2.5** (up to +0.47 on
+  single configs, e.g. 2.5/0.5/ng2/bud0.2: 0.322→0.794). The 19 remaining
+  losses are small (≤ −0.018) and concentrate at loose budgets (bud
+  0.5/1.0) and long lifetimes (life 3.0), where no family dies and the
+  liveness signal is uninformative. Artifact:
+  `results/ablate-20261028-score-v5/`.
+- Clairvoyant oracle on the smoke grid: 0.931 → +0.22 headroom over B0;
+  oracle dominance (oracle ≥ every cell) re-verified on v5 across 1620
+  checks (15 seeds × 24 configs × 3 cells, 0 violations).
 - Known cost: LPM routing pays +24% TTFT p95 and 1.65× load imbalance on the
   smoke grid; the escape-k hatch (`bench/ablations.sh`) is the mitigation.
 
