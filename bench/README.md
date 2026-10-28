@@ -8,6 +8,7 @@ from anywhere — they `cd` to the repo root themselves.
 |---|---|---|---|
 | `full_sweep.sh` | Pre-registered 2×2 factorial + oracle: 5 seeds × α {0.3, 1.0, 2.5} × lifetime {0.5, 1.0, 3.0} × GPUs {1, 2, 4, 8} × budget {0.2, 0.5, 1.0} × cells {B0, B1, B2, S, S_oracle} | 2700 | ~8–12 h |
 | `ablations.sh` | (A) LPM escape-k ∈ {1, 2, 4} on cells B1, S; (B) score recency window ∈ {180, 720} s on cells B2, S — same workload grid | 4500 | ~12–20 h |
+| `policy_ablate.py` | Eviction-policy iteration loop: lru vs score_v1 vs score on a compact 81-config grid (rr routing only, isolates placement); knobs `--death`, `--clip` | 243 | ~6–8 min |
 
 (Baseline for the estimates: 405 runs at n_requests=2000 / n_families=100
 took 15.5 min on one core; the full grid is 5000 / 200, so per-run cost is

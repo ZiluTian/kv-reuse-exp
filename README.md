@@ -97,8 +97,11 @@ obtainable ("deployment-realistic" arm).
 - **Clairvoyant upper bound:** placement with perfect future-reuse knowledge
   (trivial in simulation). Report the fraction of the oracle gap that S closes
   — quantifies whether the reuse *signal* or the *policy* is the bottleneck.
-- **Ablate the signal:** past-hit-based (LFU-like) vs. predicted
-  (document-popularity / prior-based) reuse scores.
+- **Ablate the signal (implemented):** `score_v1` = past-hit-based,
+  windowed count, last-anchored expected-next (the LFU-like arm) vs.
+  `score` = predicted inter-turn gap, now-anchored (v3). Driven by
+  `bench/policy_ablate.py`; v1 measured worse than LRU on the smoke grid
+  and is kept as the documented ablation arm.
 - **Ablate routing:** pure LPM vs. LPM with a load-balance escape hatch
   (deviate from the overlap-best GPU when its queue exceeds k× the mean).
   Main practical failure mode; worth its own knob.
@@ -167,7 +170,20 @@ python3 sim/run_sweep.py --n-requests 200 --n-families 40 \
 
 Benchmark scripts (see `bench/README.md`): `bench/full_sweep.sh` runs the
 pre-registered factorial; `bench/ablations.sh` runs the escape-k and
-recency-window ablations.
+recency-window ablations; `bench/policy_ablate.py` is the fast
+eviction-policy iteration loop.
+
+**Results so far (2026-10-28, smoke grid only — not the pre-registered run):**
+- LPM routing beats the default (≈ SGLang-as-shipped) with the stock LRU
+  cache: B1 vs B0 = +0.086 mean reuse ratio (artifact:
+  `results/smoke-20261028-score-v1/`).
+- Score v1 (windowed past-hit, last-anchored) measured ~0.14 WORSE than LRU
+  (B2: 0.571 vs 0.712) — failure modes documented in the `sim/simulator.py`
+  docstring; superseded by score v3 (now-anchored expected inter-turn gap),
+  currently under ablation.
+- Clairvoyant oracle on the same grid: 0.931 → +0.22 headroom over B0.
+- Known cost: LPM routing pays +24% TTFT p95 and 1.65× load imbalance on the
+  smoke grid; the escape-k hatch (`bench/ablations.sh`) is the mitigation.
 
 - [x] Pin the success-criteria thresholds (20% / 15%) — encoded in
       `sim/run_sweep.py` summary verdict (tune after the full sweep).

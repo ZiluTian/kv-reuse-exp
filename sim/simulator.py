@@ -23,45 +23,43 @@ Cells:
 Eviction policies
 -----------------
 lru:
-    Block-level LRU (status quo). Oldest block evicted first. Known failure
-    mode: evicts a busy family that merely had one long inter-arrival gap,
-    and evicts a temporarily-quiet but still-live family by pure recency.
+    Block-level LRU (status quo). Oldest block evicted first. Optimal for
+    homogeneous inter-arrival rates (recency IS the signal), which is why it
+    is a strong baseline: it cannot make O(1) "family is dead" errors.
 
-score (the reuse-aware placement of the hypothesis):
-    Prefix-family-granular, expected-next-reuse eviction.
-    - A "family" is the canonical block set of a prefix (block ids
-      < trace.unique_prefix_blocks); a unique tail block is its own family.
-    - Per (GPU, family): first-seen time, a deque of arrival times within
-      the last `window` seconds (observed reuse count), and last arrival.
-    - Estimated next reuse `en`:
-        * seen >= 2 times:  en = last_use + min(elapsed, window) / count
-          (last use plus the observed mean inter-arrival gap -- an unbiased
-          estimate of the next gap under uniform arrivals);
-        * seen exactly once: en = last_use + window (with one observation
-          the rate is undefined; evicting now would waste the prefill just
-          paid -- assume reuse within the window);
-        * zero arrivals in the window: en = INF (dead; evicted first, ties
-          by first-seen -- oldest corpse first).
-    - When the pool overflows, evict one block from the family with the
-      FARTHEST `en`, taking that family's HIGHEST-position block first so a
-      partially-resident family keeps serving its leading prefix.
-    - Why this signal (verified by ablation in this repo, see results/):
-      * plain per-block LFU is poisoned by families that were hot in the
-        past and are dead now (cumulative count keeps them resident while
-        currently active, still-warming-up families with ~0 hits thrash);
-      * plain windowed count (recent frequency) is BACKWARDS on
-        staggered-lifetime workloads: it measures how long a family has
-        ALREADY been active, so early-lifecycle families (most future value)
-        look coldest and are evicted first -- measured 3x reuse loss vs LRU;
-      * last-use + observed mean gap predicts when the family comes back
-        regardless of lifecycle stage, and corrects LRU's failure mode
-        (evicting a busy family that happened to have one long gap).
-    - Why family granularity? Within a prefix all blocks are referenced in
-      lockstep, so per-block recency/frequency carry no signal *inside* a
-      prefix; the reuse decision is inherently a prefix-level one. Evicting
-      a family's middle blocks would fragment the leading prefix (a cache hit
-      requires contiguity from block 0), so partial eviction proceeds from
-      the tail of the prefix backward.
+score (the reuse-aware placement of the hypothesis, v3):
+    Prefix-family-granular, NOW-ANCHORED expected-gap eviction.
+    Key workload fact: in multi-turn serving every future request for a
+    family references ALL of its blocks so far (context only grows), so the
+    placement decision is purely per-family -- which family's next turn is
+    closest -- and within a family only the LEADING blocks matter for hits.
+    - Per (GPU, family): a deque of arrival times within `window` s (the
+      observed inter-turn gaps), the last arrival; plus a per-GPU EMA of
+      observed inter-arrivals ("gap prior") for families with < 2
+      observations in the window.
+    - gap(f) = (last - first_in_window)/(n_in_window - 1) when >= 2
+      observations, else the gap prior.
+      Expected return = NOW + gap(f): the Poisson hazard is memoryless, so
+      the correct conditional expectation of the next turn is anchored at
+      decision time. (Anchoring at last use -- v1/v2 below -- puts families
+      that merely had one long gap at a return time in the PAST, inverting
+      the eviction order; a brand-new family also has the MOST remaining
+      turns, not the fewest.)
+    - dead: silence >= `death` (default: window) -> gap = INF (evicted
+      first). Liveness is decided by silence, rate by the observed gaps --
+      there is no hard "recent-window count" test.
+    - On pool overflow, evict one block from the family with the LARGEST
+      gap, taking that family's HIGHEST-position block first, so a
+      partially-resident family keeps its leading prefix (a hit requires
+      contiguity from block 0).
+
+score_v1 (ablation, kept for the record -- see bench/policy_ablate.py):
+    Last-anchored expected-next with windowed count: en = last +
+    min(elapsed, window)/count (count >= 2), en = last + window for
+    count == 1, INF for an empty window. Measured ~0.14 reuse WORSE than
+    LRU on the smoke grid (B2: 0.571 vs 0.712); failure modes (i) the
+    count==1 rule protected brand-new families, and (ii) last-anchoring
+    misranked quiet families. Superseded by `score`.
 
 Modeling assumptions (kept simple on purpose, identical for all cells):
   - each GPU runs a FIFO queue; a request occupies the GPU from prefill start
@@ -85,7 +83,8 @@ BLOCK_TOKENS = 16
 PREBLOCK_S = 0.0016   # s per 16-token block: ~100 us/token batch-1 prefill
 DECTOK_S = 0.025      # s per decode token: ~40 tok/s batch-1
 INF = float("inf")
-MIN_ELAPSED = 1e-3    # s, guard for the mean-gap estimate at first sighting
+MIN_ELAPSED = 1e-3    # s, guard for the v1 mean-gap estimate
+PRIOR_BETA = 0.1      # EMA weight for new observed inter-arrivals
 
 
 def _leading_hits(blocks, resident):
@@ -107,40 +106,45 @@ def _pct(xs, q):
 
 
 def _fam_of(b, unique, cum_len):
-    """Family of a block: its prefix family, or itself (unique tail block)."""
-    if b < unique:
-        return bisect.bisect_right(cum_len, b)
-    return b
+    """Family of a block: the family whose contiguous span contains it."""
+    return bisect.bisect_right(cum_len, b)
 
 
 class _Gpu:
-    __slots__ = ("i", "pool", "eviction", "window", "resident", "lru_order",
-                 "score_heap", "fam_first", "fam_deques", "fam_last",
-                 "fam_blocks", "last_end", "completions",
-                 "req_count", "occ_sum", "n_occ")
+    __slots__ = ("i", "pool", "eviction", "window", "death", "gap_clip",
+                 "resident", "lru_order", "score_heap", "fam_first",
+                 "fam_deques", "fam_last", "fam_blocks", "g_prior",
+                 "last_end", "completions", "req_count", "occ_sum", "n_occ")
 
-    def __init__(self, i, pool, eviction, window):
+    def __init__(self, i, pool, eviction, window, death=None, gap_clip=False):
         self.i = i
         self.pool = pool
         self.eviction = eviction
         self.window = window
+        self.death = death if death is not None else window
+        self.gap_clip = gap_clip
         self.resident = {}            # block -> None (membership only)
         self.lru_order = collections.OrderedDict()
-        # score policy: heap of (-en, last_at_push, count_at_push, first, fam)
-        #   min-heap => top = family with farthest estimated next reuse
+        # score-family heaps (see _evict for entry shapes):
+        #   v3 ("score"):    (-gap, t_push, fam)
+        #   v1 ("score_v1"): (-en, last_p, cnt_p, first, fam)
+        # Min-heap => top = family with the FARTHEST expected return (INF gap
+        # = dead family) = the one to evict.
         self.score_heap = []
-        self.fam_first = {}           # family -> first-seen time on this GPU
+        self.fam_first = {}           # family -> first-seen time (v1 + debug)
         self.fam_deques = {}          # family -> deque of arrivals within window
         self.fam_last = {}            # family -> last arrival time
         self.fam_blocks = {}          # family -> set of resident block ids
+        self.g_prior = window / 2.0   # EMA of observed inter-arrivals
         self.last_end = 0.0
         self.completions = collections.deque()  # end times, for queue length
         self.req_count = 0
         self.occ_sum = 0.0
         self.n_occ = 0
 
-    def _expected_next(self, f, now, count):
-        """Estimated next reuse time of family f (see module docstring)."""
+    # ---------- v1 (ablation) signal ----------
+    def _expected_next_v1(self, f, now, count):
+        """Last-anchored expected next reuse (see module docstring)."""
         if count == 0:
             return INF
         last = self.fam_last[f]
@@ -149,17 +153,58 @@ class _Gpu:
         elapsed = max(now - self.fam_first[f], MIN_ELAPSED)
         return last + min(elapsed, self.window) / count
 
+    # ---------- v3 (score) signal ----------
+    def _gap_v3(self, f, now):
+        """Estimated inter-turn gap of family f at time `now` (v3).
+
+        Dead families (silence >= death) get INF. With < 2 observations in
+        the window the per-family rate is unknown: use the GPU-level prior.
+        """
+        if now - self.fam_last[f] >= self.death:
+            return INF
+        dq = self.fam_deques.get(f)
+        if dq is None or len(dq) < 2:
+            g = self.g_prior
+        else:
+            g = (dq[-1] - dq[0]) / (len(dq) - 1)
+        if self.gap_clip:
+            g = min(max(g, self.death / 10.0), self.death)
+        return g
+
     def _note_arrival(self, f, t):
         """Record a request for family f at time t (score-policy signal)."""
         if f not in self.fam_first:
             self.fam_first[f] = t
+        else:
+            # update the gap prior from this observed inter-arrival
+            self.g_prior = (1.0 - PRIOR_BETA) * self.g_prior \
+                + PRIOR_BETA * (t - self.fam_last[f])
         dq = self.fam_deques.setdefault(f, collections.deque())
+        while dq and dq[0] < t - self.window:
+            dq.popleft()
         dq.append(t)
         self.fam_last[f] = t
         self.fam_blocks.setdefault(f, set())
-        heapq.heappush(self.score_heap,
-                       (-self._expected_next(f, t, len(dq)), t, len(dq),
-                        self.fam_first[f], f))
+        if self.eviction == "score_v1":
+            heapq.heappush(self.score_heap,
+                           (-self._expected_next_v1(f, t, len(dq)), t, len(dq),
+                            self.fam_first[f], f))
+        else:
+            heapq.heappush(self.score_heap, (-self._gap_v3(f, t), t, f))
+
+    # ---------- eviction ----------
+    def _finish_evict(self, f, reheap):
+        """Post-evict bookkeeping: drop all state if the family is gone,
+        otherwise keep a live heap entry (the valid pop consumed the only
+        one)."""
+        blocks = self.fam_blocks.get(f)
+        if not blocks:
+            self.fam_first.pop(f, None)
+            self.fam_deques.pop(f, None)
+            self.fam_last.pop(f, None)
+            self.fam_blocks.pop(f, None)
+        else:
+            heapq.heappush(self.score_heap, reheap)
 
     def _evict(self, now, unique, cum_len):
         """Evict one block per the active policy."""
@@ -168,38 +213,39 @@ class _Gpu:
             del self.resident[b]
             self.fam_blocks.get(_fam_of(b, unique, cum_len), set()).discard(b)
             return
-        # score: farthest estimated next reuse; tail of the prefix first
+
         while self.score_heap:
-            neg_en, last_p, cnt_p, first, f = heapq.heappop(self.score_heap)
+            entry = heapq.heappop(self.score_heap)
+            if self.eviction == "score_v1":
+                neg_en, last_p, cnt_p, first, f = entry
+            else:
+                neg_g, t_push, f = entry
             blocks = self.fam_blocks.get(f)
             if not blocks:
-                continue  # fully evicted -> stale
+                continue  # fully evicted -> stale entry
             dq = self.fam_deques[f]
             while dq and dq[0] < now - self.window:
                 dq.popleft()
-            cnt = len(dq)
-            # valid iff nothing changed since the push (no new arrival, no
-            # window expiry); otherwise recompute and re-push
-            if self.fam_last[f] != last_p or cnt != cnt_p:
-                heapq.heappush(self.score_heap,
-                               (-self._expected_next(f, now, cnt),
-                                self.fam_last[f], cnt, first, f))
-                continue
+            if self.eviction == "score_v1":
+                cnt = len(dq)
+                if self.fam_last[f] != last_p or cnt != cnt_p:
+                    heapq.heappush(self.score_heap,
+                                   (-self._expected_next_v1(f, now, cnt),
+                                    self.fam_last[f], cnt, first, f))
+                    continue
+                key = (-self._expected_next_v1(f, now, cnt),
+                       self.fam_last[f], cnt, first)
+            else:
+                g_now = self._gap_v3(f, now)
+                if -g_now != neg_g:
+                    heapq.heappush(self.score_heap, (-g_now, now, f))
+                    continue
+                key = (-g_now, now)
             b = max(blocks)  # highest position: least useful for leading hits
             del self.resident[b]
             self.lru_order.pop(b, None)
             blocks.discard(b)
-            if not blocks:
-                self.fam_first.pop(f, None)
-                self.fam_deques.pop(f, None)
-                self.fam_last.pop(f, None)
-                self.fam_blocks.pop(f, None)
-            else:
-                # the valid pop consumed the family's only heap entry; keep a
-                # live one so later evictions can still target it
-                heapq.heappush(self.score_heap,
-                               (-self._expected_next(f, now, cnt),
-                                self.fam_last[f], cnt, first, f))
+            self._finish_evict(f, key + (f,))
             return
         # fallback (should not happen: each resident family has a live entry)
         b = next(iter(self.resident))
@@ -209,19 +255,24 @@ class _Gpu:
 
 
 def simulate(trace, n_gpus, pool_blocks, routing="rr", eviction="lru",
-             escape_k=0.0, window=None, cell=""):
+             escape_k=0.0, window=None, death=None, gap_clip=False, cell=""):
     """Run one cell. pool_blocks = KV pool size PER GPU (the fixed budget).
 
+    routing in {"rr", "lpm"}; eviction in {"lru", "score", "score_v1"}.
     escape_k: for lpm routing, if the overlap-best GPU's queue exceeds
     escape_k * mean queue (and escape_k > 0), fall back to the min-queue GPU
     (load-balance escape hatch, README section 5 ablation).
-    window: recency window (s) for the score policy's rate estimate.
+    window: recency window (s) for the score policies' gap estimate.
             Default: horizon / 10.
+    death:  silence after which a family is treated as dead (score v3).
+            Default: window.
+    gap_clip: clip the v3 per-family gap estimate to [death/10, death].
     """
     unique = trace.unique_prefix_blocks
     cum_len = list(itertools.accumulate(trace.family_lengths))
     window = window if window is not None else trace.horizon / 10.0
-    gpus = [_Gpu(i, pool_blocks, eviction, window)
+    gpus = [_Gpu(i, pool_blocks, eviction, window, death=death,
+                 gap_clip=gap_clip)
             for i in range(n_gpus)]
     rr_idx = 0
     prompt_blocks = hit_blocks = 0

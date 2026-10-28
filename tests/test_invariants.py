@@ -42,7 +42,8 @@ def test_sim_invariants():
     for routing, eviction, cell in [("rr", "lru", "B0"),
                                     ("lpm", "lru", "B1"),
                                     ("rr", "score", "B2"),
-                                    ("lpm", "score", "S")]:
+                                    ("lpm", "score", "S"),
+                                    ("rr", "score_v1", "B2_v1")]:
         r = simulate(tr, 2, pool, routing=routing, eviction=eviction,
                      cell=cell)
         assert 0.0 <= r["reuse_ratio"] <= 1.0, cell
@@ -67,9 +68,10 @@ def test_score_tight_budget():
                         lifetime_scale=1.0)
     med_len = sorted(tr.family_lengths)[len(tr.family_lengths) // 2]
     for pool in (med_len, 2 * med_len):  # pool smaller than many families
-        r = simulate(tr, 4, pool, routing="lpm", eviction="score")
-        assert 0.0 <= r["reuse_ratio"] <= 1.0
-        assert r["hit_blocks"] > 0  # some reuse must survive pressure
+        for ev in ("score", "score_v1"):
+            r = simulate(tr, 4, pool, routing="lpm", eviction=ev)
+            assert 0.0 <= r["reuse_ratio"] <= 1.0, ev
+            assert r["hit_blocks"] > 0  # some reuse must survive pressure
 
 
 def test_oracle_dominates():
@@ -92,7 +94,8 @@ def test_oracle_dominates():
         for cell_kwargs in (dict(routing="rr", eviction="lru"),
                             dict(routing="lpm", eviction="lru"),
                             dict(routing="rr", eviction="score"),
-                            dict(routing="lpm", eviction="score")):
+                            dict(routing="lpm", eviction="score"),
+                            dict(routing="rr", eviction="score_v1")):
             r = simulate(tr, ng, pool, **cell_kwargs)
             assert so["hit_blocks"] >= r["hit_blocks"], (
                 f"oracle {so['hit_blocks']} < cell {r['hit_blocks']} "
